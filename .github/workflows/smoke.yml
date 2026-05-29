@@ -1,0 +1,48 @@
+name: smoke
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: |
+          curl -fsSL https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install system deps (Xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth
+
+      - name: Run install.sh (skip apt; Xvfb is already installed above)
+        run: bash scripts/install.sh --skip-apt
+        env:
+          # If browser-use's installer ever flakes in CI, set this to skip
+          # Chromium download and rely on smoke-test (which doesn't actually
+          # open a page, just lists tools).
+          BROWSER_USE_VERSION: 0.12.9
+
+      - name: Smoke test (boot server, list MCP tools)
+        run: python3 scripts/smoke-test.py
+
+      # E2E (real navigate) intentionally NOT in CI:
+      #   - depends on outbound HTTPS to example.com
+      #   - takes ~30s
+      #   - flaky on shared runners under load
+      # Run locally with `python3 scripts/e2e-test.py`.
