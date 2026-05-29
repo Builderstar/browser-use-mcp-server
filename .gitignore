@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+node_modules/
+# browser-use writes its daemon state here when run locally
+.browser-use/
