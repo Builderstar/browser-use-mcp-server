@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""browser-use-mcp — Xvfb-aware launcher for `browser-use --mcp`.
+
+Runs `browser-use --mcp` (stdio MCP server) with a headed Chrome backed by Xvfb
+when no real display is available.
+
+Works in three environments without changes:
+  1. Headless Linux server / Docker container with no $DISPLAY  -> spawns Xvfb
+  2. Linux desktop with $DISPLAY set                            -> uses existing X
+  3. Any host where the user explicitly forces headless         -> BROWSER_USE_MCP_HEADLESS=1
+
+All diagnostic output goes to STDERR so it doesn't pollute the MCP stdio stream.
+
+Env knobs:
+  BROWSER_USE_MCP_HEADLESS=1   Skip Xvfb, run --mcp without --headed
+  BROWSER_USE_MCP_DISPLAY=:99  Force a specific DISPLAY number (default: first free)
+  BROWSER_USE_MCP_SCREEN       Xvfb screen geometry (default: 1920x1080x24)
+  BROWSER_USE_MCP_EXTRA_ARGS   Extra args appended to `browser-use` (whitespace-split)
+  BROWSER_USE_HOME             Override browser-use state dir (default: ~/.browser-use)
+"""
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = SCRIPT_DIR.parent
+VENV_BU = PROJECT_DIR / ".venv" / "bin" / "browser-use"
+
+# Linux: ask the kernel to SIGTERM us if our parent (e.g. opencode) dies.
+# Without this, an `opencode kill -9` orphans this script + Xvfb + Chromium
+# to PID 1, where they'd run forever until the user notices and kills them.
+# With this, our normal try/finally cleanup runs and tears the whole stack down.
+_PR_SET_PDEATHSIG = 1  # from <sys/prctl.h>
+
+
+def _set_pdeathsig(sig: int = signal.SIGTERM) -> bool:
+    """Linux-only. Returns True on success, False if unavailable (e.g. macOS/BSD)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc_path = ctypes.util.find_library("c") or "libc.so.6"
+        libc = ctypes.CDLL(libc_path, use_errno=True)
+        if libc.prctl(_PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def log(msg: str) -> None:
+    print(f"[browser-use-mcp] {msg}", file=sys.stderr, flush=True)
+
+
+def find_free_display() -> int:
+    for n in range(99, 200):
+        if not Path(f"/tmp/.X{n}-lock").exists():
+            return n
+    raise RuntimeError("no free X display number in :99..:199")
+
+
+def start_xvfb(disp_num: int, screen: str) -> subprocess.Popen:
+    disp = f":{disp_num}"
+    log(f"starting Xvfb on {disp} (screen {screen})")
+    # -ac: disable access control. -nolisten tcp: local sockets only.
+    proc = subprocess.Popen(
+        ["Xvfb", disp, "-screen", "0", screen, "-nolisten", "tcp", "-ac"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=False,  # stay in our pgroup so SIGTERM hits us all
+    )
+    # Wait up to 5s for the X server to be ready (lockfile present).
+    deadline = time.monotonic() + 5.0
+    lock = Path(f"/tmp/.X{disp_num}-lock")
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Xvfb exited immediately with rc={proc.returncode}")
+        if lock.exists():
+            return proc
+        time.sleep(0.05)
+    log("WARN: Xvfb lockfile didn't appear in 5s; proceeding anyway")
+    return proc
+
+
+def display_looks_alive() -> bool:
+    """Cheap check that $DISPLAY is functional. Falls back to True if no tool exists."""
+    if not os.environ.get("DISPLAY"):
+        return False
+    if shutil.which("xdpyinfo") is None:
+        # Can't probe; trust the env.
+        return True
+    try:
+        r = subprocess.run(
+            ["xdpyinfo"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def main() -> int:
+    # Die if our parent (opencode) dies. This is THE mechanism that prevents
+    # Xvfb + Chromium leaks when opencode is killed -9 / crashes / SSH drops.
+    # IMPORTANT: this has to be set BEFORE we fork Xvfb / browser-use, so that
+    # when SIGTERM arrives, our try/finally cleanup still has children to tear down.
+    if _set_pdeathsig(signal.SIGTERM):
+        # Edge case: if our parent already died between exec and prctl, the
+        # kernel won't deliver the signal retroactively. Check getppid().
+        if os.getppid() == 1:
+            log("WARN: parent already PID 1 at startup; pdeathsig will not fire")
+    else:
+        log("WARN: PR_SET_PDEATHSIG not available; if opencode is killed -9, "
+            "this launcher (and Chromium) may be orphaned. Use `pkill -f browser-use-mcp` to clean up.")
+
+    if not VENV_BU.exists():
+        log(f"FATAL: browser-use binary not found at {VENV_BU}")
+        log(
+            "       Run: cd '{}' && uv venv .venv && uv pip install --python "
+            ".venv/bin/python 'browser-use[cli]' && .venv/bin/browser-use install".format(
+                PROJECT_DIR
+            )
+        )
+        return 127
+
+    xvfb: subprocess.Popen | None = None
+    head_args: list[str] = []
+    headless_optout = os.environ.get("BROWSER_USE_MCP_HEADLESS") == "1"
+
+    if headless_optout:
+        log("BROWSER_USE_MCP_HEADLESS=1 — running without --headed")
+    else:
+        if display_looks_alive():
+            log(f"reusing existing DISPLAY={os.environ['DISPLAY']}")
+        else:
+            if shutil.which("Xvfb") is None:
+                log("FATAL: no $DISPLAY and Xvfb is not installed.")
+                log("       sudo apt-get install -y xvfb  (or set BROWSER_USE_MCP_HEADLESS=1)")
+                return 127
+            forced = os.environ.get("BROWSER_USE_MCP_DISPLAY")
+            if forced:
+                disp_num = int(forced.lstrip(":"))
+            else:
+                disp_num = find_free_display()
+            screen = os.environ.get("BROWSER_USE_MCP_SCREEN", "1920x1080x24")
+            xvfb = start_xvfb(disp_num, screen)
+            os.environ["DISPLAY"] = f":{disp_num}"
+            log(f"Xvfb up (pid {xvfb.pid}, DISPLAY={os.environ['DISPLAY']})")
+        head_args = ["--headed"]
+
+    extra: list[str] = []
+    if os.environ.get("BROWSER_USE_MCP_EXTRA_ARGS"):
+        extra = shlex.split(os.environ["BROWSER_USE_MCP_EXTRA_ARGS"])
+
+    cmd = [str(VENV_BU), *head_args, *extra, "--mcp"]
+    log("launching: " + " ".join(shlex.quote(c) for c in cmd))
+
+    # Start browser-use as a child, keeping our stdio attached (it inherits 0/1/2).
+    bu = subprocess.Popen(cmd)
+
+    # Forward terminating signals to the child.
+    def _forward(signum, _frame):
+        if bu.poll() is None:
+            try:
+                bu.send_signal(signum)
+            except ProcessLookupError:
+                pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _forward)
+        except (ValueError, OSError):
+            pass
+
+    try:
+        rc = bu.wait()
+    finally:
+        # Stop the child if still alive (e.g. our parent killed us hard).
+        if bu.poll() is None:
+            try:
+                bu.terminate()
+                try:
+                    bu.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    bu.kill()
+            except Exception:
+                pass
+        # Stop Xvfb and clean up its lockfile.
+        if xvfb is not None and xvfb.poll() is None:
+            log(f"stopping Xvfb (pid {xvfb.pid})")
+            try:
+                xvfb.terminate()
+                try:
+                    xvfb.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    xvfb.kill()
+            except Exception:
+                pass
+            disp = os.environ.get("DISPLAY", "")
+            if disp.startswith(":"):
+                lock = Path(f"/tmp/.X{disp[1:]}-lock")
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
